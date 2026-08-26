@@ -898,11 +898,16 @@ def _merge_pass_data(data_dict, data_dict_one_pass):
     return data_dict
 
 
-def main():
-    """Main function to run GSM feedforward inference and save results."""
-    known_args = get_parser().parse_known_args()[0]
+def build_gsm_model(cli_args=None):
+    """Load the GSM model ONCE and return ``(net_model_gsm, args)``.
 
-    # Check resume method
+    Resident-model seam for the full-scene orchestrator: build the (heavy) GSM once,
+    then call :func:`run_gsm_for_folder` per chunk. ``cli_args`` is an argparse
+    Namespace (e.g. ``get_parser().parse_known_args()[0]``); if None it is parsed from
+    ``sys.argv``. NOTE: this moves the model to CUDA — call only at real run time.
+    """
+    known_args = cli_args if cli_args is not None else get_parser().parse_known_args()[0]
+
     resume_from_local = known_args.local_config is not None
     resume_from_wandb = (
         known_args.wandb_config is not None
@@ -914,9 +919,8 @@ def main():
 
     hparam_update = {"skybox_forward_sky_only": True}
 
-    # Load GSM model
     if resume_from_local:
-        net_model_gsm, args, global_step_gsm = create_model_from_local_config(
+        net_model_gsm, args, _ = create_model_from_local_config(
             config_path=known_args.local_config,
             checkpoint_path=known_args.local_checkpoint_path,
             hparam_update=hparam_update,
@@ -926,7 +930,7 @@ def main():
             if value is not None or not hasattr(args, key):
                 setattr(args, key, value)
     else:
-        net_model_gsm, args, global_step_gsm = create_model_from_args(
+        net_model_gsm, args, _ = create_model_from_args(
             known_args.wandb_config + ":last",
             known_args,
             get_parser(),
@@ -935,6 +939,19 @@ def main():
 
     net_model_gsm.to("cuda")
     net_model_gsm.eval()
+    return net_model_gsm, args
+
+
+def run_gsm_for_folder(net_model_gsm, args, data_folder=None, output_folder=None):
+    """Run GSM feedforward + save for ONE chunk using a preloaded model.
+
+    ``data_folder`` / ``output_folder`` override ``args`` when given, so the resident
+    model can be reused across chunks. Returns the static-Gaussian pickle path.
+    """
+    if data_folder is not None:
+        args.data_folder = data_folder
+    if output_folder is not None:
+        args.output_folder = output_folder
 
     # Load and prepare data
     data_dict = data_loading_handler(args)
@@ -944,11 +961,11 @@ def main():
 
     # Create output folder
     mode, clip_name = args.data_folder.split("/")[-2:]
-    output_folder = Path(args.output_folder) / mode / clip_name
-    output_folder.mkdir(parents=True, exist_ok=True)
+    out_folder = Path(args.output_folder) / mode / clip_name
+    out_folder.mkdir(parents=True, exist_ok=True)
 
     # Save static Gaussian splat
-    static_gs_path = (output_folder / "decoded_gs_static.pkl").as_posix()
+    static_gs_path = (out_folder / "decoded_gs_static.pkl").as_posix()
     save_splat_file(output_dict["decoded_gaussian"]["static"], static_gs_path)
 
     # Save skybox representation
@@ -959,20 +976,27 @@ def main():
         "object" in output_dict["decoded_gaussian"]
         and output_dict["decoded_gaussian"]["object"]
     ):
-        dynamic_gs_path = (output_folder / "decoded_gs_object.pkl").as_posix()
+        dynamic_gs_path = (out_folder / "decoded_gs_object.pkl").as_posix()
         with open(dynamic_gs_path, "wb") as f:
             pickle.dump(output_dict["decoded_gaussian"]["object"], f)
         print(f"Dynamic GS: {dynamic_gs_path}")
 
     # copy dynamic object info file to output folder
     dynamic_object_info_file = data_dict["original_dynamic_object_info_file"]
-    shutil.copy(dynamic_object_info_file, output_folder / "dynamic_object_info.tar")
+    shutil.copy(dynamic_object_info_file, out_folder / "dynamic_object_info.tar")
 
     # Print output paths
     print(f"Static GS: {static_gs_path}")
 
     # Visualize results
-    visualize_gsm_result(data_dict, output_dict, args, output_folder)
+    visualize_gsm_result(data_dict, output_dict, args, out_folder)
+    return static_gs_path
+
+
+def main():
+    """Main function to run GSM feedforward inference and save results."""
+    net_model_gsm, args = build_gsm_model()
+    run_gsm_for_folder(net_model_gsm, args)
 
 
 if __name__ == "__main__":

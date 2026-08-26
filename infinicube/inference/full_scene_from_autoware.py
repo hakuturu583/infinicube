@@ -132,7 +132,7 @@ def step3_cmd(args, data_folder, gs_out_root):
         "--data_folder", str(data_folder),
         "--local_config", args.gsm_config,
         "--local_checkpoint_path", args.gsm_ckpt,
-        "--output_root", str(gs_out_root),
+        "--output_folder", str(gs_out_root),
     ]
 
 
@@ -187,6 +187,74 @@ def accumulate(pkls, out_pkl, dedupe_voxel=None):
     return out_pkl
 
 
+def run_subprocess_passes(args, idxs):
+    """Fallback: fresh subprocess per chunk (reloads models each chunk). Returns pkls."""
+    chunk_pkls = []
+    for t in idxs:
+        chunk_root = Path(args.workdir) / f"chunk_{t}"
+        run(step2_cmd(args, t, chunk_root / "buffers"))
+        data_folder = step2_output_folder(chunk_root / "buffers", args.clip)
+        run(step3_cmd(args, data_folder, chunk_root / "gaussians"))
+        pkl = find_pkl(chunk_root / "gaussians")
+        if pkl is None:
+            _log(f"WARNING: no decoded_gs_static.pkl for chunk {t}; skipping")
+            continue
+        chunk_pkls.append(pkl)
+    return chunk_pkls
+
+
+def run_resident_passes(args, idxs):
+    """RESIDENT two-pass: load each model ONCE and reuse across all chunks.
+
+    Pass A loads the Wan video pipeline once (cached inside guidance_buffer_generation)
+    and generates buffers+video for every chunk. Pass B loads the GSM once and decodes
+    Gaussians for every chunk. Imports are lazy so this module stays torch-free until a
+    real run. Returns the list of per-chunk decoded_gs_static.pkl paths.
+    """
+    # ---- Pass A: guidance buffers + video (Wan model resident) ---- #
+    _log("Pass A — guidance buffers + video (video model resident across chunks)")
+    from infinicube.inference import guidance_buffer_generation as gbg
+
+    for t in idxs:
+        chunk_root = Path(args.workdir) / f"chunk_{t}"
+        _log(f"[chunk {t}] Pass A: buffers+video -> {chunk_root/'buffers'}")
+        gbg.run_guidance_buffer_for_chunk(
+            clip=args.clip,
+            extrap_voxel_time=t,
+            extrap_voxel_root=args.extrap_voxel_root,
+            output_root=str(chunk_root / "buffers"),
+            data_root=args.data_root,
+            video_checkpoint_path=args.video_ckpt,
+            use_wan_1pt3b=args.use_wan_1pt3b,
+        )
+
+    # ---- Pass B: GSM decode (GSM model resident) ---- #
+    _log("Pass B — scene Gaussians (GSM model resident across chunks)")
+    from infinicube.inference import scene_gaussian_generation as sgg
+
+    gsm_cli = sgg.get_parser().parse_known_args(
+        [
+            "--local_config", args.gsm_config,
+            "--local_checkpoint_path", args.gsm_ckpt,
+            "--output_folder", str(Path(args.workdir) / "chunk_0" / "gaussians"),
+        ]
+    )[0]
+    net_model_gsm, model_args = sgg.build_gsm_model(cli_args=gsm_cli)
+
+    chunk_pkls = []
+    for t in idxs:
+        chunk_root = Path(args.workdir) / f"chunk_{t}"
+        data_folder = step2_output_folder(chunk_root / "buffers", args.clip)
+        _log(f"[chunk {t}] Pass B: GSM decode from {data_folder}")
+        static_gs_path = sgg.run_gsm_for_folder(
+            net_model_gsm, model_args,
+            data_folder=str(data_folder),
+            output_folder=str(chunk_root / "gaussians"),
+        )
+        chunk_pkls.append(Path(static_gs_path))
+    return chunk_pkls
+
+
 def render_cmd(args, gs_dir, gs_pkl_name):
     cmd = [
         sys.executable, "infinicube/visualize/render_gaussians_video.py",
@@ -225,6 +293,10 @@ def main():
     ap.add_argument("--frames", type=int, default=240)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--use_sky", action="store_true")
+    ap.add_argument("--subprocess", action="store_true",
+                    help="Fallback: run Steps 2/3 as a fresh subprocess per chunk (reloads models "
+                         "every chunk). Default is the faster RESIDENT two-pass mode that loads each "
+                         "model once in-process and reuses it across all chunks.")
     ap.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="Validate inputs, print the plan, do NO GPU work.")
     args = ap.parse_args()
@@ -243,11 +315,21 @@ def main():
 
     if args.dry_run:
         _log("===== DRY RUN (no GPU) — planned pipeline =====")
-        for t in idxs:
-            chunk_root = Path(args.workdir) / f"chunk_{t}"
-            _log(f"[chunk {t}] Step2: {' '.join(map(str, step2_cmd(args, t, chunk_root / 'buffers')))}")
-            df = step2_output_folder(chunk_root / "buffers", args.clip)
-            _log(f"[chunk {t}] Step3: {' '.join(map(str, step3_cmd(args, df, chunk_root / 'gaussians')))}")
+        mode = "SUBPROCESS (per-chunk reload)" if args.subprocess else "RESIDENT two-pass (load once)"
+        _log(f"execution mode: {mode}")
+        if args.subprocess:
+            for t in idxs:
+                chunk_root = Path(args.workdir) / f"chunk_{t}"
+                _log(f"[chunk {t}] Step2: {' '.join(map(str, step2_cmd(args, t, chunk_root / 'buffers')))}")
+                df = step2_output_folder(chunk_root / "buffers", args.clip)
+                _log(f"[chunk {t}] Step3: {' '.join(map(str, step3_cmd(args, df, chunk_root / 'gaussians')))}")
+        else:
+            _log("Pass A (video model resident): guidance_buffer_generation.run_guidance_buffer_for_chunk("
+                 f"clip={args.clip}, extrap_voxel_time=t, output_root=<workdir>/chunk_t/buffers, "
+                 f"use_wan_1pt3b={args.use_wan_1pt3b}) for t in " + str(idxs))
+            _log("Pass B (GSM resident): scene_gaussian_generation.build_gsm_model() once, then "
+                 "run_gsm_for_folder(model, data_folder=<chunk buffers>/…/clip, "
+                 "output_folder=<workdir>/chunk_t/gaussians) for each t")
         _log("Accumulate: concat all chunks' decoded_gs_static.pkl (shared first-camera frame)"
              + (f", dedupe @ {args.dedupe_voxel} m" if args.dedupe_voxel else "")
              + f" -> {args.out_pkl}")
@@ -266,21 +348,15 @@ def main():
             _log("  - " + p)
         sys.exit(1)
 
-    # ---- real run (GPU via subprocesses) ---- #
-    chunk_pkls = []
-    sky_src = None
-    for t in idxs:
-        chunk_root = Path(args.workdir) / f"chunk_{t}"
-        run(step2_cmd(args, t, chunk_root / "buffers"))
-        data_folder = step2_output_folder(chunk_root / "buffers", args.clip)
-        run(step3_cmd(args, data_folder, chunk_root / "gaussians"))
-        pkl = find_pkl(chunk_root / "gaussians")
-        if pkl is None:
-            _log(f"WARNING: no decoded_gs_static.pkl produced for chunk {t}; skipping")
-            continue
-        chunk_pkls.append(pkl)
-        if sky_src is None:
-            sky_src = pkl  # keep one chunk's sky token/modulator for the final render
+    # ---- real run (GPU) ---- #
+    if args.subprocess:
+        _log("mode: SUBPROCESS (per-chunk model reload)")
+        chunk_pkls = run_subprocess_passes(args, idxs)
+    else:
+        _log("mode: RESIDENT two-pass (each model loaded once)")
+        chunk_pkls = run_resident_passes(args, idxs)
+
+    sky_src = chunk_pkls[0] if chunk_pkls else None
 
     if not chunk_pkls:
         _log("No gaussians produced for any chunk — aborting.")

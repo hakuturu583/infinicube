@@ -83,3 +83,35 @@ the accumulate/render plan, doing **zero** GPU work. Useful flags: `--chunks 0,3
 - Per-chunk intermediates go under `--workdir` (`.../fullscene/chunk_{t}/{buffers,gaussians}`);
   the combined scene is `--out_pkl`. One chunk's sky token/modulator is copied next to the
   combined pkl so `--use_sky` works on the merged scene.
+
+## Resident models (no per-chunk reload)
+
+Naively looping Steps 2/3 as a subprocess per chunk reloads the heavy models every
+chunk: **T5 umt5-xxl (11 GB) + Wan1.3B** for Step 2 and the **GSM** for Step 3 — minutes
+of pure load per chunk. The orchestrator now defaults to a **RESIDENT two-pass** design
+that loads each model once and reuses it across all N chunks:
+
+- **Pass A** (video model resident): `guidance_buffer_generation.run_guidance_buffer_for_chunk(...)`
+  per chunk. The Wan pipeline is lazily built and cached on
+  `generate_guidance_buffer_and_save._video_generator`, so it loads only on chunk 0 and
+  is reused for chunks 1..N-1.
+- **Pass B** (GSM resident): `scene_gaussian_generation.build_gsm_model()` **once**, then
+  `run_gsm_for_folder(model, data_folder, output_folder)` per chunk.
+
+Seams extracted (original CLIs preserved — each `main()` now just calls build-once then
+run-one):
+- `scene_gaussian_generation.py`: `build_gsm_model(cli_args)` → `(net_model_gsm, args)`;
+  `run_gsm_for_folder(net_model_gsm, args, data_folder, output_folder)`.
+- `guidance_buffer_generation.py`: `run_guidance_buffer_for_chunk(clip, extrap_voxel_time,
+  extrap_voxel_root, output_root, ...)` (thin wrapper; residency via the existing cache).
+
+`--subprocess` restores the old per-chunk-subprocess behavior as a fallback. The
+orchestrator imports torch only lazily inside the resident passes, so `--dry-run` and
+module import stay CPU/torch-free.
+
+**Expected speedup:** the per-chunk model load (tens of seconds to minutes each,
+×2 models ×N chunks) is paid **once** instead of N times. With residency the per-chunk
+cost is just the actual work — video generation (~1.5 s/step × ~50 steps ≈ 75 s) + GSM
+decode (~1–2 s) per chunk — plus one T5+Wan load and one GSM load for the whole run.
+**Real wall-clock timing must be measured post-training** (no GPU runs were performed
+for this refactor).
