@@ -110,9 +110,9 @@ def interpolate_poses(poses, n_out):
     return out
 
 
-def load_gaussians(gs_dir, device="cuda"):
-    """Load ``decoded_gs_static.pkl`` into the dict the renderer expects."""
-    with open(os.path.join(gs_dir, "decoded_gs_static.pkl"), "rb") as f:
+def load_gaussians(gs_pkl_path, device="cuda"):
+    """Load a decoded-Gaussian pickle into the dict the renderer expects."""
+    with open(gs_pkl_path, "rb") as f:
         gs = pickle.load(f)
     return {
         "xyz": torch.tensor(gs["xyz"], device=device),
@@ -143,11 +143,22 @@ def main():
     ap.add_argument("--out", default="visualization/gaussians_render.mp4")
     ap.add_argument("--frames_dir", default=None, help="Optional dir to also dump per-frame jpgs.")
     ap.add_argument("--use_sky", action="store_true", help="Composite the learned skybox behind the scene.")
+    ap.add_argument("--gs_pkl", default="decoded_gs_static.pkl",
+                    help="Gaussian pickle name inside --gs_dir (e.g. decoded_gs_static_fullscene.pkl).")
+    ap.add_argument("--pose_start", type=int, default=0, help="First trajectory pose index to use.")
+    ap.add_argument("--pose_end", type=int, default=-1,
+                    help="Last trajectory pose index (inclusive; -1 = last).")
+    ap.add_argument("--dolly", type=float, nargs=2, default=None, metavar=("X_START", "X_END"),
+                    help="Forward-dolly mode: drive along +x from X_START to X_END using the last "
+                         "pose's orientation. Useful for a single-chunk reconstruction whose clean "
+                         "region is a short forward cone (see SHIM_PORT_NOTES.md). Not needed once "
+                         "the full scene has coverage.")
     args = ap.parse_args()
 
     device = "cuda"
-    gaussians = load_gaussians(args.gs_dir, device)
-    print(f"loaded {gaussians['xyz'].shape[0]} gaussians")
+    gs_pkl_path = os.path.join(args.gs_dir, args.gs_pkl)
+    gaussians = load_gaussians(gs_pkl_path, device)
+    print(f"loaded {gaussians['xyz'].shape[0]} gaussians from {gs_pkl_path}")
 
     poses, (fx, fy, cx, cy, w, h) = load_camera(args.buf_dir)
     hfov = 2 * np.arctan(w / (2 * fx))
@@ -159,13 +170,26 @@ def main():
         try:
             from infinicube.utils.sky_utils import read_skybox
 
-            skybox_dict = read_skybox(os.path.join(args.gs_dir, "decoded_gs_static.pkl"))
+            skybox_dict = read_skybox(gs_pkl_path)
             print("sky enabled")
         except Exception as exc:  # pragma: no cover
             print("sky disabled (build failed):", repr(exc)[:160])
 
-    traj = interpolate_poses(poses, args.frames)
-    print(f"interpolated to {len(traj)} frames")
+    if args.dolly is not None:
+        # Forward-dolly along +x through a single chunk's well-reconstructed cone,
+        # using the last (clean) pose's orientation. See SHIM_PORT_NOTES.md.
+        x0, x1 = args.dolly
+        base = poses[-1].copy()
+        traj = np.tile(base, (args.frames, 1, 1))
+        traj[:, 0, 3] = np.linspace(x0, x1, args.frames)
+        traj[:, 1, 3] = base[1, 3]
+        traj[:, 2, 3] = base[2, 3]
+        print(f"dolly mode: x {x0}->{x1} using pose[-1] orientation, {args.frames} frames")
+    else:
+        end = args.pose_end if args.pose_end >= 0 else len(poses) - 1
+        poses = poses[args.pose_start:end + 1]
+        traj = interpolate_poses(poses, args.frames)
+        print(f"using poses [{args.pose_start}:{end}] -> interpolated to {len(traj)} frames")
 
     if args.frames_dir:
         os.makedirs(args.frames_dir, exist_ok=True)

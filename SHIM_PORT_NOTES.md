@@ -93,3 +93,27 @@ validated.
 
 ### gsplat
 - Rebuilt v1.4.0 from source for Blackwell (CUDA 12.8, `TORCH_CUDA_ARCH_LIST=12.0+PTX`, torch-lib LDFLAGS). Renders on sm_120.
+
+## Fly-through video "bowl" — root cause & fix
+
+**Symptom:** `kashiwanoha_3dgs_render.mp4` (rendered along the raw ego trajectory, poses 0→48)
+showed the scene fanned into a "bowl"/dome from an off-axis-looking view, while the still
+`kashiwanoha_3dgs_render.jpg` (a crop of the GSM's own `static_pd_images.jpg`) looked correct.
+
+**Root cause (verified, not a code bug):** rendering the decoded Gaussians with the GSM's own
+`render_gsplat_func` at **pose 0** produces the *identical* bowl; at **pose 48** it renders
+clean/photorealistic (that pose IS the "good still"). So the camera convention, fov, and
+gaussian/pose frame are all correct and match `standard_3dgs_rendering_func`. The feed-forward
+GSM (config `view1`, one forward pass) reconstructs a **forward "cone"**: geometry is only dense
+and clean when the camera is deep inside it. Sweeping forward-extrapolated cameras shows the
+clean, populated region is only about **x ≈ 20 → 34 m** (mean brightness 110→94; by x≈44 it goes
+dark/empty). Viewed from the trajectory start (x=0) the camera stares at the poorly-reconstructed
+far-field fan → the bowl. The original video simply started at x=0.
+
+**Fix (`scratchpad_render_video.py --dolly X0 X1`):** render a forward dolly that stays inside the
+well-reconstructed cone — drive along +x from x=20 to x=30 using the last (clean) pose's
+orientation. Result: a smooth 120-frame / 30 fps / 4 s forward-driving view that matches the still
+throughout (verified frames 0/60/119). `visualization/kashiwanoha_3dgs_render.mp4`.
+Raw trajectory / interpolation modes are still available (`--pose_start/--pose_end`).
+The limited clean range is an inherent property of the single feed-forward reconstruction, not the
+renderer.
