@@ -182,10 +182,14 @@ def transform_points(points, transformation_matrix):
     Returns:
         transformed points: torch.Tensor, shape [N, 3]
     """
-    points = torch.cat([points, torch.ones_like(points[:, :1])], dim=1)
-    points = torch.matmul(transformation_matrix, points.t()).t()[:, :3]
+    # torch>=2.x disallows mixed-dtype matmul; compute in the matrix's precision
+    # (usually float64 for pose transforms) and cast back to the input dtype.
+    orig_dtype = points.dtype
+    mat = transformation_matrix
+    points = torch.cat([points, torch.ones_like(points[:, :1])], dim=1).to(mat.dtype)
+    points = torch.matmul(mat, points.t()).t()[:, :3]
 
-    return points
+    return points.to(orig_dtype)
 
 
 def transform_poses(poses, transformation_matrix):
