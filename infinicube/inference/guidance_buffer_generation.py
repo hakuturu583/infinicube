@@ -808,6 +808,7 @@ def generate_guidance_buffer_trajectory(
     video_prompt,
     disable_video_generation,
     video_checkpoint_path,
+    use_wan_1pt3b,
 ):
     """Generate guidance buffer for trajectory mode."""
     output_folder = output_root / clip
@@ -880,6 +881,7 @@ def generate_guidance_buffer_trajectory(
         video_prompt=video_prompt,
         disable_video_generation=disable_video_generation,
         video_checkpoint_path=video_checkpoint_path,
+        use_wan_1pt3b=use_wan_1pt3b,
     )
 
 
