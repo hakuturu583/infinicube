@@ -16,6 +16,7 @@ Detailed documentation is organized by topic:
 - **[Training](README/training.md)** - Training models 
 - **[Inference](README/inference.md)** - Running inference on trained models
 - **[Visualization](README/visualize.md)** - Interactive visualization tools for data and results
+- **[Autoware HD Map](README/autoware_hdmap.md)** - Conditioning on real Autoware Lanelet2 (`.osm`) HD maps via `simple_lanelet2`
 
 
 

@@ -25,6 +25,7 @@ share/python-wheels/
 
 .venv/
 .venv-waymo/
+.venv-lanelet/
 venv/
 ENV/
 env/
@@ -73,9 +74,15 @@ temp/
 
 .ruff_cache/
 checkpoints/
+/checkpoints
 
 visualization/
 
 .premature_checkpoints
 
 /models/
+/models
+
+# scratch / temp working files
+scratchpad*
+/data/
