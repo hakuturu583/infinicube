@@ -327,9 +327,20 @@ def _flu_to_opencv_matrix(pose_flu):
     return pose_cv
 
 
-def build_ego_trajectory(lanelets_lr, lanelet_map, to_xyz, spacing=0.5, z_offset=0.0):
+def build_ego_trajectory(
+    lanelets_lr, lanelet_map, to_xyz, spacing=0.5, z_offset=0.0,
+    max_len=None, stride=1,
+):
     """Build a dense sequence of ego poses following the longest connected chain of
     drivable lanelets.
+
+    Args:
+        spacing: distance between resampled waypoints, meters.
+        z_offset: vertical offset added to the ego poses (sensor height).
+        max_len: if given, truncate the trajectory to this many meters (from the
+            start). ``None`` keeps the full route — the map-scale trajectory needed
+            for full-scene reconstruction.
+        stride: keep every ``stride``-th pose after resampling (subsample density).
 
     Returns an (K, 4, 4) array of poses in the opencv convention, expressed in the
     same world frame as the map points.
@@ -348,8 +359,15 @@ def build_ego_trajectory(lanelets_lr, lanelet_map, to_xyz, spacing=0.5, z_offset
     # Resample the path at a fixed spacing.
     seg = np.linalg.norm(np.diff(path, axis=0), axis=1)
     total = seg.sum()
+    if max_len is not None:
+        total = min(total, float(max_len))
     n = max(int(np.ceil(total / spacing)) + 1, 2)
-    path = _resample_polyline(path.tolist(), n)
+    # Resample only the retained portion of the arc length.
+    full = _resample_polyline(path.tolist(), max(int(np.ceil(seg.sum() / spacing)) + 1, 2))
+    path = full[:n]
+    if stride > 1:
+        path = path[::stride]
+    path = path.copy()
     path[:, 2] += z_offset
 
     return _poses_from_path(path)
@@ -426,6 +444,22 @@ def _poses_from_path(path):
 # --- Writing webdataset tars --------------------------------------------------
 
 
+def front_camera_intrinsic(width=832, height=480, hfov_deg=50.1, vfov_deg=34.6):
+    """Front-camera intrinsics ``[fx, fy, cx, cy, W, H]`` in the format
+    ``guidance_buffer_generation.py`` / the GSM renderer expect.
+
+    Defaults (832x480, hfov 50.1 deg, vfov 34.6 deg) reproduce the values the
+    pipeline consumed successfully (fx~890.5, fy~770.6, cx=416, cy=240). fx and fy
+    differ because the source Waymo-style intrinsic was rescaled anisotropically to
+    the 480p buffer aspect.
+    """
+    fx = width / (2.0 * np.tan(np.radians(hfov_deg) / 2.0))
+    fy = height / (2.0 * np.tan(np.radians(vfov_deg) / 2.0))
+    cx = width / 2.0
+    cy = height / 2.0
+    return np.array([fx, fy, cx, cy, float(width), float(height)], dtype=np.float32)
+
+
 def write_infinicube_wds(
     clip,
     output_root,
@@ -433,10 +467,20 @@ def write_infinicube_wds(
     road_line_pts,
     road_surface_pts,
     ego_poses,
+    intrinsic=None,
 ):
-    """Write the tar files that :func:`infinicube.voxelgen.utils.extrap_util.get_wds_data`
-    expects for map-conditioned voxel world generation."""
+    """Write the webdataset tars for the whole InfiniCube pipeline.
+
+    Step 1 (voxel world generation) needs the road point clouds + pose +
+    static_object_info. Steps 2/3 (guidance buffers, Wan video, scene Gaussians)
+    additionally need the camera ``intrinsic`` tar and per-frame
+    ``dynamic_object_info`` (and per-frame ``static_object_info``), so we emit all of
+    them here. Object dicts are empty because the HD map bakes in no vehicles.
+    """
     output_root = Path(output_root)
+    num_frames = len(ego_poses)
+    if intrinsic is None:
+        intrinsic = front_camera_intrinsic()
 
     write_to_tar(
         {"road_edge.npy": road_edge_pts.astype(np.float32)},
@@ -459,13 +503,23 @@ def write_infinicube_wds(
         pose_sample[f"{idx:06d}.pose.front.npy"] = pose.astype(np.float64)
     write_to_tar(pose_sample, output_root / "pose" / f"{clip}.tar")
 
-    # Empty static-object info (no vehicles baked into the HD map). get_wds_data
-    # loads this to build 3D boxes; an empty dict yields zero boxes.
+    # Front-camera intrinsic (needed by guidance_buffer_generation / renderer).
     write_to_tar(
-        {"000000.static_object_info.json": {}},
-        output_root / "static_object_info" / f"{clip}.tar",
+        {"intrinsic.front.npy": intrinsic.astype(np.float32)},
+        output_root / "intrinsic" / f"{clip}.tar",
         __key__=clip,
     )
+
+    # Per-frame static / dynamic object info (empty). The guidance-buffer step
+    # indexes both per frame as `{idx:06d}.{static,dynamic}_object_info.json`;
+    # get_wds_data (Step 1) reads `000000.static_object_info.json`, which is included.
+    static_sample = {"__key__": clip}
+    dynamic_sample = {"__key__": clip}
+    for idx in range(max(num_frames, 1)):
+        static_sample[f"{idx:06d}.static_object_info.json"] = {}
+        dynamic_sample[f"{idx:06d}.dynamic_object_info.json"] = {}
+    write_to_tar(static_sample, output_root / "static_object_info" / f"{clip}.tar")
+    write_to_tar(dynamic_sample, output_root / "dynamic_object_info" / f"{clip}.tar")
 
 
 def convert(
@@ -476,6 +530,12 @@ def convert(
     surface_spacing=0.4,
     pose_spacing=0.5,
     ego_z_offset=0.0,
+    traj_max_len=None,
+    pose_stride=1,
+    img_width=832,
+    img_height=480,
+    hfov_deg=50.1,
+    vfov_deg=34.6,
 ):
     """End-to-end conversion of a single Autoware lanelet2 map to an InfiniCube clip."""
     logger.info(f"Loading Autoware lanelet2 map: {osm_path}")
@@ -527,8 +587,13 @@ def convert(
         to_xyz,
         spacing=pose_spacing,
         z_offset=ego_z_offset,
+        max_len=traj_max_len,
+        stride=pose_stride,
     )
     logger.info(f"ego trajectory: {len(ego_poses)} poses")
+
+    intrinsic = front_camera_intrinsic(img_width, img_height, hfov_deg, vfov_deg)
+    logger.info(f"front intrinsic [fx fy cx cy w h]: {np.round(intrinsic, 2).tolist()}")
 
     write_infinicube_wds(
         clip,
@@ -537,6 +602,7 @@ def convert(
         road_line_pts,
         road_surface_pts,
         ego_poses,
+        intrinsic=intrinsic,
     )
     logger.info(f"Done. Wrote clip '{clip}' under {Path(output_root).resolve()}")
 
@@ -545,6 +611,7 @@ def convert(
         "road_line": road_line_pts,
         "road_surface": road_surface_pts,
         "ego_poses": ego_poses,
+        "intrinsic": intrinsic,
     }
 
 
@@ -582,6 +649,23 @@ def main():
         default=0.0,
         help="Vertical offset added to ego poses above the lane surface (default: 0).",
     )
+    parser.add_argument(
+        "--traj_max_len",
+        type=float,
+        default=None,
+        help="Truncate the ego trajectory to this many meters. Default: full route "
+        "(map-scale, needed for full-scene reconstruction).",
+    )
+    parser.add_argument(
+        "--pose_stride",
+        type=int,
+        default=1,
+        help="Keep every N-th resampled pose (subsample density; default: 1).",
+    )
+    parser.add_argument("--img_width", type=int, default=832, help="Buffer width (default 832).")
+    parser.add_argument("--img_height", type=int, default=480, help="Buffer height (default 480).")
+    parser.add_argument("--hfov_deg", type=float, default=50.1, help="Horizontal FoV (deg).")
+    parser.add_argument("--vfov_deg", type=float, default=34.6, help="Vertical FoV (deg).")
     args = parser.parse_args()
 
     convert(
@@ -592,6 +676,12 @@ def main():
         surface_spacing=args.surface_spacing,
         pose_spacing=args.pose_spacing,
         ego_z_offset=args.ego_z_offset,
+        traj_max_len=args.traj_max_len,
+        pose_stride=args.pose_stride,
+        img_width=args.img_width,
+        img_height=args.img_height,
+        hfov_deg=args.hfov_deg,
+        vfov_deg=args.vfov_deg,
     )
 
 

@@ -74,20 +74,39 @@ python infinicube/data_process/autoware_hdmap_to_wds.py \
     --output_root data
 ```
 
-This writes the standard InfiniCube webdataset layout:
+This writes the full InfiniCube webdataset layout needed by **Steps 1–3**:
 
 ```
 data/
 ├── 3d_road_edge_voxelsize_025/my_autoware_scene.tar     # road_edge.npy   (N,3)
 ├── 3d_road_line_voxelsize_025/my_autoware_scene.tar     # road_line.npy   (N,3)
 ├── 3d_road_surface_voxelsize_04/my_autoware_scene.tar   # road_surface.npy(N,3)
-├── pose/my_autoware_scene.tar                           # 000000.pose.front.npy ... (4,4) opencv
-└── static_object_info/my_autoware_scene.tar             # empty (no vehicles baked into the HD map)
+├── pose/my_autoware_scene.tar                           # {i:06d}.pose.front.npy (4,4) opencv
+├── intrinsic/my_autoware_scene.tar                      # intrinsic.front.npy [fx fy cx cy W H]
+├── static_object_info/my_autoware_scene.tar             # per-frame, empty (no baked vehicles)
+└── dynamic_object_info/my_autoware_scene.tar            # per-frame, empty
 ```
 
+The `intrinsic` and per-frame `static/dynamic_object_info` tars are what the guidance-
+buffer / scene-Gaussian stages (Steps 2–3) require; Step 1 only reads the road clouds,
+`pose`, and `static_object_info`.
+
 Useful flags: `--segment_interval` (polyline discretization, default 0.25 m),
-`--surface_spacing` (0.4 m), `--pose_spacing` (0.5 m), `--ego_z_offset` (sensor height
-above the lane surface, default 0).
+`--surface_spacing` (0.4 m), `--pose_spacing` (0.5 m), `--ego_z_offset` (sensor height,
+default 0), `--traj_max_len` (cap the trajectory length in meters; default = **full
+route**, the map-scale trajectory needed for full-scene reconstruction), `--pose_stride`
+(subsample pose density), and camera-intrinsic overrides `--img_width/--img_height/
+--hfov_deg/--vfov_deg` (defaults 832×480, 50.1°×34.6° → fx≈890, fy≈771, cx=416, cy=240).
+
+### Full-scene reconstruction (whole map, not one 51.2 m chunk)
+
+A single voxel world covers only one grid crop. To reconstruct and fly through the
+**whole** Kashiwanoha route, run Step 1 over the full trajectory, then use the
+orchestrator `infinicube/inference/full_scene_from_autoware.py`, which loops Steps 2–3
+over every voxel world and accumulates the Gaussians into one scene. Validate the plan
+with `--dry-run` (CPU only, no GPU); see `FULLSCENE_NOTES.md` for the ready-to-run
+command and the coordinate-frame note (all voxel worlds share the first-camera frame, so
+the chunks concatenate directly).
 
 ### Get a sample Autoware map
 

@@ -885,6 +885,62 @@ def generate_guidance_buffer_trajectory(
     )
 
 
+def run_guidance_buffer_for_chunk(
+    clip,
+    extrap_voxel_time,
+    extrap_voxel_root,
+    output_root,
+    data_root="data",
+    resolution="480p",
+    make_dynamic=False,
+    video_prompt=(
+        "The video is capture by a camera mounted on a vehicle. The video is about a "
+        "driving scene captured at daytime. The weather is clear."
+    ),
+    disable_video_generation=False,
+    video_checkpoint_path="checkpoints/wan1pt3b-t2v-buffer-step-3500.safetensors",
+    use_wan_1pt3b=True,
+    offset_setting=("frame", 1.0),
+):
+    """Resident-model seam: generate guidance buffers + video for ONE voxel-world chunk.
+
+    The Wan (T5 + 1.3B) video pipeline is loaded lazily by
+    :func:`generate_guidance_buffer_and_save` and cached on that function
+    (``._video_generator``), so calling this repeatedly in ONE process loads the model
+    only on the first chunk and reuses it for the rest — eliminating the per-chunk
+    reload that a fresh subprocess per chunk incurs. Keep ``video_checkpoint_path`` /
+    ``use_wan_1pt3b`` constant across chunks so the cached model stays valid.
+
+    ``output_root`` should be per-chunk; buffers land under
+    ``<output_root>/trajectory_pose_sample_1frame/<clip>``.
+    """
+    output_root_p = Path(output_root)
+    if offset_setting is not None:
+        unit, val = offset_setting
+        output_root_p = output_root_p / (
+            f"trajectory_pose_sample_{val:.2f}m" if unit == "meter"
+            else f"trajectory_pose_sample_{int(val)}frame"
+        )
+    else:
+        output_root_p = output_root_p / "trajectory"
+
+    generate_guidance_buffer_trajectory(
+        clip,
+        extrap_voxel_time,
+        extrap_voxel_root,
+        output_root_p,
+        resolution,
+        offset_setting,
+        make_dynamic,
+        data_root,
+        video_prompt,
+        disable_video_generation,
+        video_checkpoint_path,
+        use_wan_1pt3b,
+    )
+    return output_root_p / clip
+
+
 def generate_guidance_buffer_blocks(
     clip,
     extrap_voxel_time,
